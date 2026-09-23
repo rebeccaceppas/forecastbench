@@ -51,11 +51,14 @@ class LeaderboardType(str, Enum):
     * BASELINE: The baseline leaderboard: FB forecast files w/o freeze values.
     * TOURNAMENT: The tournament leaderboard. All forecast files.
     * PRELIMINARY: The preliminary leaderboard using dataset questions only.
+    * LOW_PROBABILITY: Baseline models scored on low-probability market questions
+      (plus the usual dataset questions).
     """
 
     BASELINE = "baseline"
     TOURNAMENT = "tournament"
     PRELIMINARY = "preliminary"
+    LOW_PROBABILITY = "low_probability"
 
 
 class MarketQuestionAdjustment(str, Enum):
@@ -68,6 +71,7 @@ class MarketQuestionAdjustment(str, Enum):
 LEADERBOARD_FILE_STEMS = {
     LeaderboardType.BASELINE: "baseline_leaderboard",
     LeaderboardType.TOURNAMENT: "tournament_leaderboard",
+    LeaderboardType.LOW_PROBABILITY: "low_probability_leaderboard",
 }
 
 
@@ -95,6 +99,9 @@ HUMAN_MODELS_TO_HIGHLIGHT = [m["model"] for m in HUMAN_MODELS]
 LEADERBOARD_DECIMAL_PLACES = 1
 
 IMPUTED_CUTOFF_PCT = 5
+
+# Crowd price on the forecast due date below which a market question counts as low-probability.
+LOW_PROBABILITY_MARKET_THRESHOLD = 0.10
 
 MIN_NUM_DATASET_QUESTIONS = 225
 
@@ -405,6 +412,22 @@ def get_market_mask(df: pd.DataFrame) -> pd.Series:
     return df["source"].isin(MARKET_SOURCE_NAMES)
 
 
+def get_low_probability_market_mask(df: pd.DataFrame) -> pd.Series:
+    """Return True for market questions with due-date crowd price below the cutoff.
+
+    Dataset `market_value_on_due_date` is a series level, not a probability, so this mask is
+    False for every dataset row.
+
+    Args:
+        df (pd.DataFrame): Forecast rows that include `source` and `market_value_on_due_date`.
+
+    Returns:
+        pd.Series: Boolean mask aligned to `df`.
+    """
+    values = pd.to_numeric(df["market_value_on_due_date"], errors="coerce")
+    return get_market_mask(df=df) & (values < LOW_PROBABILITY_MARKET_THRESHOLD)
+
+
 def get_masks(df: pd.DataFrame) -> Dict[str, pd.Series]:
     """Generate boolean masks for dataset and market filters, including resolution status.
 
@@ -560,6 +583,7 @@ def get_df_info(
     df: pd.DataFrame,
     org_and_model: Dict[str, str],
     forecast_due_date: str,
+    filter_low_probability_markets: bool = False,
 ) -> Optional[pd.DataFrame]:
     """Preprocess a forecast set DataFrame for a given model and due date.
 
@@ -568,6 +592,9 @@ def get_df_info(
         org_and_model (Dict[str, str]): Normalized organization/model identity associated with the
             forecast set.
         forecast_due_date (str): Forecast due date in 'YYYY-MM-DD' format.
+        filter_low_probability_markets (bool): If True, keep only resolved market questions whose
+            `market_value_on_due_date` is below `LOW_PROBABILITY_MARKET_THRESHOLD`. Dataset rows
+            are unchanged.
 
     Returns:
         Optional[pd.DataFrame]: The processed DataFrame or None if the imputed percentage exceeds
@@ -603,6 +630,16 @@ def get_df_info(
                 return None
 
     df = df[masks["dataset"] | masks["market_resolved"]]
+
+    if filter_low_probability_markets:
+        n_market_before = int(get_masks(df)["market_resolved"].sum())
+        df = df[~get_market_mask(df) | get_low_probability_market_mask(df)]
+        n_market_after = int(get_masks(df)["market_resolved"].sum())
+        if org_and_model.get("model") == BASELINE_ORG_NAIVE_MODEL["model"]:
+            logger.info(
+                f"{forecast_due_date}: kept {n_market_after} / {n_market_before} resolved market "
+                f"questions with market_value_on_due_date < {LOW_PROBABILITY_MARKET_THRESHOLD}."
+            )
 
     # Set formats of columns and add columns useful for processing
     df["resolution_date"] = pd.to_datetime(df["resolution_date"]).dt.date
@@ -683,6 +720,7 @@ def process_forecast_file(
     org_and_model: Dict[str, str],
     df: pd.DataFrame,
     forecast_due_date: str,
+    filter_low_probability_markets: bool = False,
 ) -> None:
     """Append each model's processed forecast set to the leaderboard_entries list.
 
@@ -691,6 +729,7 @@ def process_forecast_file(
         org_and_model (Dict[str, str]): The organization and model associated with the forecast set.
         df (pd.DataFrame): Forecast set.
         forecast_due_date (str): Forecast due date in 'YYYY-MM-DD' format.
+        filter_low_probability_markets (bool): Forwarded to `get_df_info`.
 
     Returns:
         None: Modifies `leaderboard_entries` in place. Logs a warning if processing is skipped.
@@ -699,6 +738,7 @@ def process_forecast_file(
         df=df,
         org_and_model=org_and_model,
         forecast_due_date=forecast_due_date,
+        filter_low_probability_markets=filter_low_probability_markets,
     )
     if processed is None:
         logger.warning(
@@ -1013,8 +1053,11 @@ def write_leaderboard_html_file(
         "BSS",
     ]
     df_html = df[[c for c in html_cols if c in df.columns]]
+    title = f"{constants.BENCHMARK_NAME} Leaderboard"
+    if leaderboard_type == LeaderboardType.LOW_PROBABILITY:
+        title = f"{constants.BENCHMARK_NAME} Low-Probability Leaderboard"
     html = template.render(
-        title=f"{constants.BENCHMARK_NAME} Leaderboard",
+        title=title,
         data=df_html.to_dict(orient="records"),
         columns=json.dumps(df_html.columns.tolist()),
         leaderboard_update_date=LEADERBOARD_UPDATED_DATE_STR,
@@ -3121,8 +3164,12 @@ def summarize_parity_dates(all_dates: dict, leaderboard_intersection_dates: dict
         - Percentiles are computed via np.quantile at [0.025, 0.5, 0.975].
     """
 
-    def fmt(ordinal: float) -> str:
-        return pd.Timestamp.fromordinal(int(round(ordinal))).strftime("%B %Y") if ordinal else ""
+    def fmt(ordinal: Union[float, NaTType]) -> str:
+        # `calculate_sota_super_intersection_date` returns pd.NaT when the SOTA trend never
+        # crosses the superforecaster median. pd.NaT is truthy, so check it explicitly.
+        if not ordinal or pd.isna(ordinal):
+            return ""
+        return pd.Timestamp.fromordinal(int(round(ordinal))).strftime("%B %Y")
 
     retval = {}
     for question_type, leaderboards in all_dates.items():
@@ -3336,7 +3383,7 @@ def make_leaderboard(
         add_model_age_at_due_date=True,
         add_model_release_date=False,
     )
-    if leaderboard_type == LeaderboardType.BASELINE:
+    if leaderboard_type in (LeaderboardType.BASELINE, LeaderboardType.LOW_PROBABILITY):
         df = filter_to_baseline_leaderboard_models(df=df)
         market_question_adjustment = MarketQuestionAdjustment.TWO_WAY_FIXED_EFFECTS
     elif leaderboard_type == LeaderboardType.TOURNAMENT:
@@ -3522,6 +3569,7 @@ def download_and_compile_processed_forecast_files(
     bucket: str,
     min_days: int,
     min_num_market_questions: int,
+    filter_low_probability_markets: bool = False,
 ) -> List[pd.DataFrame]:
     """Download and compile processed forecast files into entries list.
 
@@ -3530,6 +3578,8 @@ def download_and_compile_processed_forecast_files(
         min_days (int): Minimum number of days before today a question set must be to be included.
         min_num_market_questions (int): Minimum number of resolved market questions required per
             date. If 0, skip filtering by market question count.
+        filter_low_probability_markets (bool): If True, drop non-low-probability market rows when
+            processing each forecast file.
 
     Returns:
         List[pd.DataFrame]: List of DataFrames for each processed forecast file,
@@ -3581,6 +3631,7 @@ def download_and_compile_processed_forecast_files(
                 org_and_model=org_and_model,
                 df=df,
                 forecast_due_date=forecast_due_date,
+                filter_low_probability_markets=filter_low_probability_markets,
             )
 
     return leaderboard_entries, valid_dates
@@ -3588,24 +3639,31 @@ def download_and_compile_processed_forecast_files(
 
 @decorator.log_runtime
 def driver(leaderboard_type: LeaderboardType) -> None:
-    """Create a new baseline or tournament leaderboard.
+    """Create a new baseline, tournament, or low-probability leaderboard.
 
     Args:
-        leaderboard_type (LeaderboardType): Baseline or tournament leaderboard to create.
+        leaderboard_type (LeaderboardType): Leaderboard variant to create.
 
     Returns:
         None: Exits the process on completion.
     """
     min_days = 50
     min_num_market_questions = 50
-    if leaderboard_type not in [LeaderboardType.BASELINE, LeaderboardType.TOURNAMENT]:
-        raise ValueError("driver only supports baseline and tournament leaderboards.")
+    if leaderboard_type not in [
+        LeaderboardType.BASELINE,
+        LeaderboardType.TOURNAMENT,
+        LeaderboardType.LOW_PROBABILITY,
+    ]:
+        raise ValueError(
+            "driver only supports baseline, tournament, and low-probability leaderboards."
+        )
 
     logger.info(colored(f"Making {leaderboard_type.value} leaderboard.", "red"))
     leaderboard_entries, valid_dates = download_and_compile_processed_forecast_files(
         bucket=env.PROCESSED_FORECAST_SETS_BUCKET,
         min_days=min_days,
         min_num_market_questions=min_num_market_questions,
+        filter_low_probability_markets=leaderboard_type == LeaderboardType.LOW_PROBABILITY,
     )
     make_leaderboard(leaderboard_entries=leaderboard_entries, leaderboard_type=leaderboard_type)
     logger.info(
@@ -3640,7 +3698,12 @@ if __name__ == "__main__":
         driver(LeaderboardType.BASELINE)
     elif leaderboard_type == "tournament":
         driver(LeaderboardType.TOURNAMENT)
+    elif leaderboard_type == "low_probability":
+        driver(LeaderboardType.LOW_PROBABILITY)
     elif leaderboard_type == "preliminary":
         driver_preliminary()
     else:
-        raise ValueError("LEADERBOARD_TYPE must be 'baseline', 'tournament', or 'preliminary'.")
+        raise ValueError(
+            "LEADERBOARD_TYPE must be 'baseline', 'tournament', 'preliminary', or "
+            "'low_probability'."
+        )
