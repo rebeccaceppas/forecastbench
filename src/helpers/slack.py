@@ -5,7 +5,7 @@ import logging
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
-from . import keys  # noqa: E402
+from . import env, keys  # noqa: E402
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -13,6 +13,10 @@ logger = logging.getLogger(__name__)
 
 def send_message(message=""):
     """Send a slack message."""
+    if env.RUNNING_LOCALLY:
+        logger.info(f"Running locally; not sending Slack message: {message}")
+        return
+
     client = WebClient(token=keys.API_SLACK_BOT_NOTIFICATION)
 
     try:
