@@ -33,7 +33,7 @@ def patched_import_environment():
     """
     with (
         stubbed_modules(STUBS),
-        reset_modules("leaderboard.main", "llm_identities"),
+        reset_modules("leaderboard.main", "llm_identities", "intermediate_analysis"),
         chdir(ROOT / "src" / "leaderboard"),
     ):
         yield
