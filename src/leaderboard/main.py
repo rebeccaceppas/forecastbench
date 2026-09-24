@@ -53,12 +53,15 @@ class LeaderboardType(str, Enum):
     * PRELIMINARY: The preliminary leaderboard using dataset questions only.
     * LOW_PROBABILITY: Baseline models scored on low-probability market questions
       (plus the usual dataset questions).
+    * LOW_PROBABILITY_TOURNAMENT: Tournament models scored on the same low-probability
+      market subset (plus the usual dataset questions).
     """
 
     BASELINE = "baseline"
     TOURNAMENT = "tournament"
     PRELIMINARY = "preliminary"
     LOW_PROBABILITY = "low_probability"
+    LOW_PROBABILITY_TOURNAMENT = "low_probability_tournament"
 
 
 class MarketQuestionAdjustment(str, Enum):
@@ -72,6 +75,12 @@ LEADERBOARD_FILE_STEMS = {
     LeaderboardType.BASELINE: "baseline_leaderboard",
     LeaderboardType.TOURNAMENT: "tournament_leaderboard",
     LeaderboardType.LOW_PROBABILITY: "low_probability_leaderboard",
+    LeaderboardType.LOW_PROBABILITY_TOURNAMENT: "low_probability_tournament_leaderboard",
+}
+
+LOW_PROBABILITY_LEADERBOARD_TYPES = {
+    LeaderboardType.LOW_PROBABILITY,
+    LeaderboardType.LOW_PROBABILITY_TOURNAMENT,
 }
 
 
@@ -1056,6 +1065,8 @@ def write_leaderboard_html_file(
     title = f"{constants.BENCHMARK_NAME} Leaderboard"
     if leaderboard_type == LeaderboardType.LOW_PROBABILITY:
         title = f"{constants.BENCHMARK_NAME} Low-Probability Leaderboard"
+    elif leaderboard_type == LeaderboardType.LOW_PROBABILITY_TOURNAMENT:
+        title = f"{constants.BENCHMARK_NAME} Low-Probability Tournament Leaderboard"
     html = template.render(
         title=title,
         data=df_html.to_dict(orient="records"),
@@ -1548,7 +1559,8 @@ def write_leaderboard_js_file_full(
         last_updated_date=LAST_UPDATED_DATE,
         model_highlight_rows=HUMAN_MODELS_TO_HIGHLIGHT,
         col_desc=TOOLTIP_COLUMN_DESCRIPTIONS,
-        is_tournament=leaderboard_type == LeaderboardType.TOURNAMENT,
+        is_tournament=leaderboard_type
+        in (LeaderboardType.TOURNAMENT, LeaderboardType.LOW_PROBABILITY_TOURNAMENT),
         leaderboard_type=leaderboard_type.value,
     )
 
@@ -3386,7 +3398,10 @@ def make_leaderboard(
     if leaderboard_type in (LeaderboardType.BASELINE, LeaderboardType.LOW_PROBABILITY):
         df = filter_to_baseline_leaderboard_models(df=df)
         market_question_adjustment = MarketQuestionAdjustment.TWO_WAY_FIXED_EFFECTS
-    elif leaderboard_type == LeaderboardType.TOURNAMENT:
+    elif leaderboard_type in (
+        LeaderboardType.TOURNAMENT,
+        LeaderboardType.LOW_PROBABILITY_TOURNAMENT,
+    ):
         df = filter_to_tournament_leaderboard_models(df=df)
         market_question_adjustment = MarketQuestionAdjustment.MARKET_BRIER
     else:
@@ -3653,6 +3668,7 @@ def driver(leaderboard_type: LeaderboardType) -> None:
         LeaderboardType.BASELINE,
         LeaderboardType.TOURNAMENT,
         LeaderboardType.LOW_PROBABILITY,
+        LeaderboardType.LOW_PROBABILITY_TOURNAMENT,
     ]:
         raise ValueError(
             "driver only supports baseline, tournament, and low-probability leaderboards."
@@ -3663,7 +3679,7 @@ def driver(leaderboard_type: LeaderboardType) -> None:
         bucket=env.PROCESSED_FORECAST_SETS_BUCKET,
         min_days=min_days,
         min_num_market_questions=min_num_market_questions,
-        filter_low_probability_markets=leaderboard_type == LeaderboardType.LOW_PROBABILITY,
+        filter_low_probability_markets=leaderboard_type in LOW_PROBABILITY_LEADERBOARD_TYPES,
     )
     make_leaderboard(leaderboard_entries=leaderboard_entries, leaderboard_type=leaderboard_type)
     logger.info(
@@ -3700,10 +3716,12 @@ if __name__ == "__main__":
         driver(LeaderboardType.TOURNAMENT)
     elif leaderboard_type == "low_probability":
         driver(LeaderboardType.LOW_PROBABILITY)
+    elif leaderboard_type == "low_probability_tournament":
+        driver(LeaderboardType.LOW_PROBABILITY_TOURNAMENT)
     elif leaderboard_type == "preliminary":
         driver_preliminary()
     else:
         raise ValueError(
-            "LEADERBOARD_TYPE must be 'baseline', 'tournament', 'preliminary', or "
-            "'low_probability'."
+            "LEADERBOARD_TYPE must be 'baseline', 'tournament', 'preliminary', "
+            "'low_probability', or 'low_probability_tournament'."
         )

@@ -96,6 +96,14 @@ def test_parity_summary_reports_empty_string_when_no_intersection(leaderboard_ma
     assert summary["market"]["low_probability_leaderboard"]["lower"] == "January 2027"
 
 
+def test_low_probability_variants_write_to_distinct_stems(leaderboard_main):
+    stems = leaderboard_main.LEADERBOARD_FILE_STEMS
+    assert (
+        stems[leaderboard_main.LeaderboardType.LOW_PROBABILITY]
+        != stems[leaderboard_main.LeaderboardType.LOW_PROBABILITY_TOURNAMENT]
+    )
+
+
 def test_parity_summary_formats_a_real_intersection_date(leaderboard_main):
     ordinal = float(pd.Timestamp("2027-01-15").toordinal())
     summary = leaderboard_main.summarize_parity_dates(
