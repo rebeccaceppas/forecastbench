@@ -73,6 +73,9 @@ Thumbs.db
 # Worktrees
 .worktrees/
 
+# Locally rendered leaderboard figures
+src/leaderboard/sota_graphs/
+
 # Compressed files
 *.7z
 *.dmg

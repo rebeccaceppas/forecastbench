@@ -33,7 +33,12 @@ def patched_import_environment():
     """
     with (
         stubbed_modules(STUBS),
-        reset_modules("leaderboard.main", "llm_identities", "intermediate_analysis"),
+        reset_modules(
+            "leaderboard.main",
+            "llm_identities",
+            "intermediate_analysis",
+            "sota_graph_figure",
+        ),
         chdir(ROOT / "src" / "leaderboard"),
     ):
         yield
