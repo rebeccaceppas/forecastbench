@@ -55,6 +55,9 @@ class LeaderboardType(str, Enum):
       (plus the usual dataset questions).
     * LOW_PROBABILITY_TOURNAMENT: Tournament models scored on the same low-probability
       market subset (plus the usual dataset questions).
+    * EXTREME: Baseline models scored on extreme market questions, those priced below
+      10% or above 90% on the due date (plus the usual dataset questions).
+    * EXTREME_TOURNAMENT: Tournament models scored on that same extreme market subset.
     """
 
     BASELINE = "baseline"
@@ -62,6 +65,8 @@ class LeaderboardType(str, Enum):
     PRELIMINARY = "preliminary"
     LOW_PROBABILITY = "low_probability"
     LOW_PROBABILITY_TOURNAMENT = "low_probability_tournament"
+    EXTREME = "extreme"
+    EXTREME_TOURNAMENT = "extreme_tournament"
 
 
 class MarketQuestionAdjustment(str, Enum):
@@ -76,11 +81,27 @@ LEADERBOARD_FILE_STEMS = {
     LeaderboardType.TOURNAMENT: "tournament_leaderboard",
     LeaderboardType.LOW_PROBABILITY: "low_probability_leaderboard",
     LeaderboardType.LOW_PROBABILITY_TOURNAMENT: "low_probability_tournament_leaderboard",
+    LeaderboardType.EXTREME: "extreme_leaderboard",
+    LeaderboardType.EXTREME_TOURNAMENT: "extreme_tournament_leaderboard",
 }
 
 LOW_PROBABILITY_LEADERBOARD_TYPES = {
     LeaderboardType.LOW_PROBABILITY,
     LeaderboardType.LOW_PROBABILITY_TOURNAMENT,
+}
+EXTREME_LEADERBOARD_TYPES = {
+    LeaderboardType.EXTREME,
+    LeaderboardType.EXTREME_TOURNAMENT,
+}
+BASELINE_STYLE_LEADERBOARD_TYPES = {
+    LeaderboardType.BASELINE,
+    LeaderboardType.LOW_PROBABILITY,
+    LeaderboardType.EXTREME,
+}
+TOURNAMENT_STYLE_LEADERBOARD_TYPES = {
+    LeaderboardType.TOURNAMENT,
+    LeaderboardType.LOW_PROBABILITY_TOURNAMENT,
+    LeaderboardType.EXTREME_TOURNAMENT,
 }
 
 
@@ -111,6 +132,20 @@ IMPUTED_CUTOFF_PCT = 5
 
 # Crowd price on the forecast due date below which a market question counts as low-probability.
 LOW_PROBABILITY_MARKET_THRESHOLD = 0.10
+# Crowd price above which a market question counts as the high tail of an extreme question.
+EXTREME_MARKET_HIGH_THRESHOLD = 0.90
+# Forecasts outside this range are clipped before the log score, so 0 and 1 stay finite.
+LOG_SCORE_CLIP = 0.001
+CLIPPED_LOG_SKILL_COLUMNS = (
+    "clipped_log_skill_bits_dataset",
+    "clipped_log_skill_bits_market",
+    "clipped_log_skill_bits_overall",
+)
+LOG_SCORE_DISPLAY_COLUMNS = (
+    "Log score dataset",
+    "Log score market",
+    "Log score overall",
+)
 
 MIN_NUM_DATASET_QUESTIONS = 225
 
@@ -308,6 +343,21 @@ TOOLTIP_COLUMN_DESCRIPTIONS = {
     "Pct times top 5%": (
         f"Percentage of {N_REPLICATES:,} simulations in which this model ranked in the top 5%."
     ),
+    "Log score dataset": (
+        "Clipped log score on dataset questions, in bits versus Always 0.5. "
+        "Forecasts are clipped to [0.001, 0.999]. "
+        "0 = Always 0.5, 1 = perfect. Higher is better. No bootstrap interval."
+    ),
+    "Log score market": (
+        "Clipped log score on market questions, in bits versus Always 0.5. "
+        "Forecasts are clipped to [0.001, 0.999]. "
+        "0 = Always 0.5, 1 = perfect. Higher is better. No bootstrap interval."
+    ),
+    "Log score overall": (
+        "Mean of the dataset and market clipped log scores, in bits versus Always 0.5. "
+        "Forecasts are clipped to [0.001, 0.999]. "
+        "0 = Always 0.5, 1 = perfect. Higher is better. No bootstrap interval."
+    ),
     "Peer": (
         "Peer score relative to the average Brier score on each question. "
         "Higher scores are better."
@@ -435,6 +485,26 @@ def get_low_probability_market_mask(df: pd.DataFrame) -> pd.Series:
     """
     values = pd.to_numeric(df["market_value_on_due_date"], errors="coerce")
     return get_market_mask(df=df) & (values < LOW_PROBABILITY_MARKET_THRESHOLD)
+
+
+def get_extreme_market_mask(df: pd.DataFrame) -> pd.Series:
+    """Return True for market questions priced in either tail on the due date.
+
+    A market question is extreme when `market_value_on_due_date` is strictly below
+    `LOW_PROBABILITY_MARKET_THRESHOLD` or strictly above `EXTREME_MARKET_HIGH_THRESHOLD`.
+    Dataset rows are never extreme: that column is a series level, not a probability.
+
+    Args:
+        df (pd.DataFrame): Forecast rows that include `source` and `market_value_on_due_date`.
+
+    Returns:
+        pd.Series: Boolean mask aligned to `df`.
+    """
+    values = pd.to_numeric(df["market_value_on_due_date"], errors="coerce")
+    in_either_tail = (values < LOW_PROBABILITY_MARKET_THRESHOLD) | (
+        values > EXTREME_MARKET_HIGH_THRESHOLD
+    )
+    return get_market_mask(df=df) & in_either_tail
 
 
 def get_masks(df: pd.DataFrame) -> Dict[str, pd.Series]:
@@ -593,6 +663,7 @@ def get_df_info(
     org_and_model: Dict[str, str],
     forecast_due_date: str,
     filter_low_probability_markets: bool = False,
+    filter_extreme_markets: bool = False,
 ) -> Optional[pd.DataFrame]:
     """Preprocess a forecast set DataFrame for a given model and due date.
 
@@ -604,6 +675,9 @@ def get_df_info(
         filter_low_probability_markets (bool): If True, keep only resolved market questions whose
             `market_value_on_due_date` is below `LOW_PROBABILITY_MARKET_THRESHOLD`. Dataset rows
             are unchanged.
+        filter_extreme_markets (bool): If True, keep only resolved market questions whose
+            `market_value_on_due_date` is below `LOW_PROBABILITY_MARKET_THRESHOLD` or above
+            `EXTREME_MARKET_HIGH_THRESHOLD`. Dataset rows are unchanged.
 
     Returns:
         Optional[pd.DataFrame]: The processed DataFrame or None if the imputed percentage exceeds
@@ -640,15 +714,27 @@ def get_df_info(
 
     df = df[masks["dataset"] | masks["market_resolved"]]
 
+    if filter_low_probability_markets and filter_extreme_markets:
+        raise ValueError("Choose at most one market-value filter.")
     if filter_low_probability_markets:
-        n_market_before = int(get_masks(df)["market_resolved"].sum())
-        df = df[~get_market_mask(df) | get_low_probability_market_mask(df)]
-        n_market_after = int(get_masks(df)["market_resolved"].sum())
-        if org_and_model.get("model") == BASELINE_ORG_NAIVE_MODEL["model"]:
-            logger.info(
-                f"{forecast_due_date}: kept {n_market_after} / {n_market_before} resolved market "
-                f"questions with market_value_on_due_date < {LOW_PROBABILITY_MARKET_THRESHOLD}."
-            )
+        df = _keep_selected_markets(
+            df=df,
+            market_mask=get_low_probability_market_mask(df),
+            forecast_due_date=forecast_due_date,
+            org_and_model=org_and_model,
+            description=(f"market_value_on_due_date < {LOW_PROBABILITY_MARKET_THRESHOLD}"),
+        )
+    elif filter_extreme_markets:
+        df = _keep_selected_markets(
+            df=df,
+            market_mask=get_extreme_market_mask(df),
+            forecast_due_date=forecast_due_date,
+            org_and_model=org_and_model,
+            description=(
+                f"market_value_on_due_date < {LOW_PROBABILITY_MARKET_THRESHOLD} or "
+                f"> {EXTREME_MARKET_HIGH_THRESHOLD}"
+            ),
+        )
 
     # Set formats of columns and add columns useful for processing
     df["resolution_date"] = pd.to_datetime(df["resolution_date"]).dt.date
@@ -724,12 +810,43 @@ def get_df_info(
     return df.sort_values(by=["forecast_due_date", "source", "id"], ignore_index=True)
 
 
+def _keep_selected_markets(
+    df: pd.DataFrame,
+    market_mask: pd.Series,
+    forecast_due_date: str,
+    org_and_model: Dict[str, str],
+    description: str,
+) -> pd.DataFrame:
+    """Drop resolved market rows that fail `market_mask`, leaving dataset rows in place.
+
+    Args:
+        df (pd.DataFrame): Forecast rows after unresolved markets have been removed.
+        market_mask (pd.Series): Markets to keep.
+        forecast_due_date (str): Forecast due date, used only in the log line.
+        org_and_model (Dict[str, str]): Model identity; the naive forecaster logs the counts.
+        description (str): Human-readable rule, appended to the log line.
+
+    Returns:
+        pd.DataFrame: Dataset rows plus the selected market rows.
+    """
+    n_market_before = int(get_masks(df)["market_resolved"].sum())
+    df = df[~get_market_mask(df) | market_mask]
+    if org_and_model.get("model") == BASELINE_ORG_NAIVE_MODEL["model"]:
+        n_market_after = int(get_masks(df)["market_resolved"].sum())
+        logger.info(
+            f"{forecast_due_date}: kept {n_market_after} / {n_market_before} resolved market "
+            f"questions with {description}."
+        )
+    return df
+
+
 def process_forecast_file(
     leaderboard_entries: List[pd.DataFrame],
     org_and_model: Dict[str, str],
     df: pd.DataFrame,
     forecast_due_date: str,
     filter_low_probability_markets: bool = False,
+    filter_extreme_markets: bool = False,
 ) -> None:
     """Append each model's processed forecast set to the leaderboard_entries list.
 
@@ -739,6 +856,7 @@ def process_forecast_file(
         df (pd.DataFrame): Forecast set.
         forecast_due_date (str): Forecast due date in 'YYYY-MM-DD' format.
         filter_low_probability_markets (bool): Forwarded to `get_df_info`.
+        filter_extreme_markets (bool): Forwarded to `get_df_info`.
 
     Returns:
         None: Modifies `leaderboard_entries` in place. Logs a warning if processing is skipped.
@@ -748,6 +866,7 @@ def process_forecast_file(
         org_and_model=org_and_model,
         forecast_due_date=forecast_due_date,
         filter_low_probability_markets=filter_low_probability_markets,
+        filter_extreme_markets=filter_extreme_markets,
     )
     if processed is None:
         logger.warning(
@@ -932,6 +1051,11 @@ def write_leaderboard_html_file(
         <th>Pct times top 5%</th>
         <th>Peer</th>
         <th>BSS</th>
+        {% if include_log_score %}
+        <th>Log score dataset</th>
+        <th>Log score market</th>
+        <th>Log score overall</th>
+        {% endif %}
       </tr>
     </thead>
     <tbody></tbody>
@@ -1017,6 +1141,19 @@ def write_leaderboard_html_file(
             col.render = function(d,t){ return t==='display'?parseFloat(d).toFixed(3):d; };
             col.orderSequence = ['desc','asc'];
           }
+          if (name==='Log score dataset' || name==='Log score market' || name==='Log score overall') {
+            const logScoreDesc = {
+              'Log score dataset': `{{ col_desc["Log score dataset"] }}`,
+              'Log score market': `{{ col_desc["Log score market"] }}`,
+              'Log score overall': `{{ col_desc["Log score overall"] }}`
+            };
+            col.title = name + ' <i class="info circle icon" data-html="' +
+                        logScoreDesc[name] + '"></i>';
+            col.render = function(d,t){
+              return t==='display' && d !== '' && d !== null ? parseFloat(d).toFixed(3) : d;
+            };
+            col.orderSequence = ['desc','asc'];
+          }
           return col;
         });
         $('#dataTable').DataTable({
@@ -1036,8 +1173,9 @@ def write_leaderboard_html_file(
   </body>
 </html>""")
 
-    # The HTML template has a hardcoded <thead> expecting exactly these columns.
-    # Any extra columns (e.g. Rescaled Brier) are CSV-only.
+    # The HTML template has a hardcoded <thead> expecting these columns.
+    # Rescaled Brier stays CSV-only. Log-score columns are added for the extreme
+    # tournament board when they are present.
     html_cols = [
         "Rank",
         "Team",
@@ -1060,6 +1198,7 @@ def write_leaderboard_html_file(
         "Pct times top 5%",
         "Peer",
         "BSS",
+        *LOG_SCORE_DISPLAY_COLUMNS,
     ]
     df_html = df[[c for c in html_cols if c in df.columns]]
     title = f"{constants.BENCHMARK_NAME} Leaderboard"
@@ -1067,6 +1206,10 @@ def write_leaderboard_html_file(
         title = f"{constants.BENCHMARK_NAME} Low-Probability Leaderboard"
     elif leaderboard_type == LeaderboardType.LOW_PROBABILITY_TOURNAMENT:
         title = f"{constants.BENCHMARK_NAME} Low-Probability Tournament Leaderboard"
+    elif leaderboard_type == LeaderboardType.EXTREME:
+        title = f"{constants.BENCHMARK_NAME} Extreme Leaderboard"
+    elif leaderboard_type == LeaderboardType.EXTREME_TOURNAMENT:
+        title = f"{constants.BENCHMARK_NAME} Extreme Tournament Leaderboard"
     html = template.render(
         title=title,
         data=df_html.to_dict(orient="records"),
@@ -1074,6 +1217,7 @@ def write_leaderboard_html_file(
         leaderboard_update_date=LEADERBOARD_UPDATED_DATE_STR,
         sorting_column_number=sorting_column_number,
         col_desc=TOOLTIP_COLUMN_DESCRIPTIONS,
+        include_log_score=all(column in df_html.columns for column in LOG_SCORE_DISPLAY_COLUMNS),
     )
 
     stem = f"leaderboard_{leaderboard_type.value}"
@@ -1559,8 +1703,7 @@ def write_leaderboard_js_file_full(
         last_updated_date=LAST_UPDATED_DATE,
         model_highlight_rows=HUMAN_MODELS_TO_HIGHLIGHT,
         col_desc=TOOLTIP_COLUMN_DESCRIPTIONS,
-        is_tournament=leaderboard_type
-        in (LeaderboardType.TOURNAMENT, LeaderboardType.LOW_PROBABILITY_TOURNAMENT),
+        is_tournament=leaderboard_type in TOURNAMENT_STYLE_LEADERBOARD_TYPES,
         leaderboard_type=leaderboard_type.value,
     )
 
@@ -2000,6 +2143,49 @@ def write_sota_graph_csv(
     df.to_csv(local_filename_csv, index=False)
 
 
+def write_log_score_sota_graph_csv(
+    df: pd.DataFrame,
+    leaderboard_type: LeaderboardType,
+) -> None:
+    """Write a SOTA-graph CSV that uses clipped log skill instead of the Brier Index.
+
+    The Brier Index file `sota_graph_<type>.csv` is left unchanged. Confidence intervals are
+    blank because the log score is not bootstrapped.
+
+    Args:
+        df (pd.DataFrame): Leaderboard after display-column renaming, including model release date
+            and the log-score columns.
+        leaderboard_type (LeaderboardType): Leaderboard these scores belong to.
+
+    Returns:
+        None.
+    """
+    output = pd.DataFrame(
+        {
+            "Team": df["Team"],
+            "Model Organization": df["Model Organization"],
+            "Model": df["Model"],
+            "Dataset": df["Log score dataset"],
+            "N dataset": df["N dataset"],
+            "Dataset 95% CI": "",
+            "Market": df["Log score market"],
+            "N market": df["N market"],
+            "Market 95% CI": "",
+            "Overall": df["Log score overall"],
+            "N": df["N"],
+            "Overall 95% CI": "",
+            "Model release date": df["Model release date"],
+        }
+    )
+    directory = data_utils.get_mounted_bucket(bucket=env.PUBLIC_RELEASE_BUCKET)
+    destination_folder = "leaderboards/csv"
+    os.makedirs(f"{directory}/{destination_folder}", exist_ok=True)
+    destination_filename_csv = (
+        f"{destination_folder}/sota_graph_{leaderboard_type.value}_log_score.csv"
+    )
+    output.to_csv(f"{directory}/{destination_filename_csv}", index=False)
+
+
 def write_leaderboard(
     df: pd.DataFrame,
     primary_scoring_func: Callable[..., any],
@@ -2016,6 +2202,10 @@ def write_leaderboard(
         None.
     """
     logger.info("Making HTML and CSV leaderboard file.")
+
+    for column in CLIPPED_LOG_SKILL_COLUMNS:
+        if column in df.columns:
+            df[column] = pd.to_numeric(df[column], errors="coerce").round(3)
 
     # Replace NaN with empty strings for display
     df = df.fillna("")
@@ -2117,6 +2307,7 @@ def write_leaderboard(
             f"{rescaled}_market",
             f"{rescaled}_overall",
             "model_release_date",
+            *[column for column in CLIPPED_LOG_SKILL_COLUMNS if column in df.columns],
         ]
     ].rename(
         columns={
@@ -2141,6 +2332,9 @@ def write_leaderboard(
             f"{rescaled}_market": "Brier Market",
             f"{rescaled}_overall": "Brier Overall",
             "model_release_date": "Model release date",
+            "clipped_log_skill_bits_dataset": "Log score dataset",
+            "clipped_log_skill_bits_market": "Log score market",
+            "clipped_log_skill_bits_overall": "Log score overall",
         }
     )
 
@@ -2149,6 +2343,8 @@ def write_leaderboard(
         df=df,
         leaderboard_type=leaderboard_type,
     )
+    if all(column in df.columns for column in LOG_SCORE_DISPLAY_COLUMNS):
+        write_log_score_sota_graph_csv(df=df, leaderboard_type=leaderboard_type)
     df = df.drop(columns="Model release date")
 
     # Write HTML and CSV leaderboard for datasets repo
@@ -2158,18 +2354,18 @@ def write_leaderboard(
         leaderboard_type=leaderboard_type,
     )
 
-    # Write JS leaderboard for website
-    df = df.drop(
-        columns=[
-            "Pct times № 1",
-            "Pct times top 5%",
-            "Peer",
-            "BSS",
-            "Brier Dataset",
-            "Brier Market",
-            "Brier Overall",
-        ]
-    )
+    # Write JS leaderboard for website. Log-score columns stay on the CSV and HTML only.
+    columns_to_drop = [
+        "Pct times № 1",
+        "Pct times top 5%",
+        "Peer",
+        "BSS",
+        "Brier Dataset",
+        "Brier Market",
+        "Brier Overall",
+        *[column for column in LOG_SCORE_DISPLAY_COLUMNS if column in df.columns],
+    ]
+    df = df.drop(columns=columns_to_drop)
     write_leaderboard_js_files(
         df=df,
         leaderboard_type=leaderboard_type,
@@ -2356,6 +2552,57 @@ def brier_score(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["brier_score"] = (df["forecast"] - df["resolved_to"]) ** 2
     return df
+
+
+def clipped_log_skill_bits(df: pd.DataFrame) -> pd.DataFrame:
+    """Add the clipped log score, in bits better than Always 0.5.
+
+    Forecasts are clipped to [`LOG_SCORE_CLIP`, `1 - LOG_SCORE_CLIP`] so a forecast of 0 or 1
+    stays finite. The per-row score is `1 - (-log2(probability assigned to the outcome))`.
+    Always 0.5 scores 0 and a perfect forecast scores 1. Higher is better.
+
+    Args:
+        df (pd.DataFrame): Rows with `forecast` and `resolved_to`.
+
+    Returns:
+        pd.DataFrame: Copy with a `clipped_log_skill_bits` column.
+    """
+    df = df.copy()
+    probability = pd.to_numeric(df["forecast"], errors="coerce").clip(
+        LOG_SCORE_CLIP, 1 - LOG_SCORE_CLIP
+    )
+    outcome = pd.to_numeric(df["resolved_to"], errors="coerce")
+    assigned = probability * outcome + (1 - probability) * (1 - outcome)
+    df["clipped_log_skill_bits"] = 1 - (-np.log2(assigned))
+    return df
+
+
+def summarize_clipped_log_skill(df: pd.DataFrame) -> pd.DataFrame:
+    """Average the clipped log score by model for dataset, market, and overall.
+
+    Overall is the unweighted mean of the dataset and market averages, matching the Brier
+    Index overall.
+
+    Args:
+        df (pd.DataFrame): Combined forecast rows with model identity columns.
+
+    Returns:
+        pd.DataFrame: One row per model, with the three clipped-log-skill columns.
+    """
+    df = clipped_log_skill_bits(df)
+    means = []
+    for question_type in ("dataset", "market"):
+        question_rows = df[get_masks(df)[question_type]]
+        means.append(
+            question_rows.groupby("model_pk", dropna=False)["clipped_log_skill_bits"]
+            .mean()
+            .rename(f"clipped_log_skill_bits_{question_type}")
+        )
+    summary = pd.concat(means, axis=1).reset_index()
+    summary["clipped_log_skill_bits_overall"] = summary[
+        ["clipped_log_skill_bits_dataset", "clipped_log_skill_bits_market"]
+    ].mean(axis=1, skipna=False)
+    return summary
 
 
 def filter_to_baseline_leaderboard_models(df: pd.DataFrame) -> pd.DataFrame:
@@ -3395,13 +3642,10 @@ def make_leaderboard(
         add_model_age_at_due_date=True,
         add_model_release_date=False,
     )
-    if leaderboard_type in (LeaderboardType.BASELINE, LeaderboardType.LOW_PROBABILITY):
+    if leaderboard_type in BASELINE_STYLE_LEADERBOARD_TYPES:
         df = filter_to_baseline_leaderboard_models(df=df)
         market_question_adjustment = MarketQuestionAdjustment.TWO_WAY_FIXED_EFFECTS
-    elif leaderboard_type in (
-        LeaderboardType.TOURNAMENT,
-        LeaderboardType.LOW_PROBABILITY_TOURNAMENT,
-    ):
+    elif leaderboard_type in TOURNAMENT_STYLE_LEADERBOARD_TYPES:
         df = filter_to_tournament_leaderboard_models(df=df)
         market_question_adjustment = MarketQuestionAdjustment.MARKET_BRIER
     else:
@@ -3421,6 +3665,12 @@ def make_leaderboard(
         scoring_funcs=scoring_funcs,
         market_question_adjustment=market_question_adjustment,
     )
+    if leaderboard_type == LeaderboardType.EXTREME_TOURNAMENT:
+        df_leaderboard = df_leaderboard.merge(
+            summarize_clipped_log_skill(df),
+            on="model_pk",
+            how="left",
+        )
 
     # Get simulated scores
     df_simulated_scores_dataset, df_simulated_scores_market, df_simulated_scores_overall = (
@@ -3585,6 +3835,7 @@ def download_and_compile_processed_forecast_files(
     min_days: int,
     min_num_market_questions: int,
     filter_low_probability_markets: bool = False,
+    filter_extreme_markets: bool = False,
 ) -> List[pd.DataFrame]:
     """Download and compile processed forecast files into entries list.
 
@@ -3594,6 +3845,8 @@ def download_and_compile_processed_forecast_files(
         min_num_market_questions (int): Minimum number of resolved market questions required per
             date. If 0, skip filtering by market question count.
         filter_low_probability_markets (bool): If True, drop non-low-probability market rows when
+            processing each forecast file.
+        filter_extreme_markets (bool): If True, drop market rows outside either price tail when
             processing each forecast file.
 
     Returns:
@@ -3647,6 +3900,7 @@ def download_and_compile_processed_forecast_files(
                 df=df,
                 forecast_due_date=forecast_due_date,
                 filter_low_probability_markets=filter_low_probability_markets,
+                filter_extreme_markets=filter_extreme_markets,
             )
 
     return leaderboard_entries, valid_dates
@@ -3654,7 +3908,7 @@ def download_and_compile_processed_forecast_files(
 
 @decorator.log_runtime
 def driver(leaderboard_type: LeaderboardType) -> None:
-    """Create a new baseline, tournament, or low-probability leaderboard.
+    """Create a baseline, tournament, low-probability, or extreme leaderboard.
 
     Args:
         leaderboard_type (LeaderboardType): Leaderboard variant to create.
@@ -3664,14 +3918,10 @@ def driver(leaderboard_type: LeaderboardType) -> None:
     """
     min_days = 50
     min_num_market_questions = 50
-    if leaderboard_type not in [
-        LeaderboardType.BASELINE,
-        LeaderboardType.TOURNAMENT,
-        LeaderboardType.LOW_PROBABILITY,
-        LeaderboardType.LOW_PROBABILITY_TOURNAMENT,
-    ]:
+    supported = BASELINE_STYLE_LEADERBOARD_TYPES | TOURNAMENT_STYLE_LEADERBOARD_TYPES
+    if leaderboard_type not in supported:
         raise ValueError(
-            "driver only supports baseline, tournament, and low-probability leaderboards."
+            "driver only supports baseline, tournament, low-probability, and extreme leaderboards."
         )
 
     logger.info(colored(f"Making {leaderboard_type.value} leaderboard.", "red"))
@@ -3680,6 +3930,7 @@ def driver(leaderboard_type: LeaderboardType) -> None:
         min_days=min_days,
         min_num_market_questions=min_num_market_questions,
         filter_low_probability_markets=leaderboard_type in LOW_PROBABILITY_LEADERBOARD_TYPES,
+        filter_extreme_markets=leaderboard_type in EXTREME_LEADERBOARD_TYPES,
     )
     make_leaderboard(leaderboard_entries=leaderboard_entries, leaderboard_type=leaderboard_type)
     logger.info(
@@ -3708,6 +3959,95 @@ def driver_preliminary() -> None:
     logger.info(colored("Done.", "red"))
 
 
+def refresh_extreme_tournament_log_score() -> None:
+    """Add clipped log-skill columns to the extreme tournament leaderboard already on disk.
+
+    Reads the processed forecasts once and appends the columns to the existing CSV and HTML.
+    The Brier Index, its bootstrap intervals, and `sota_graph_extreme_tournament.csv` are left
+    as they are. A separate `sota_graph_extreme_tournament_log_score.csv` is written for the
+    log-score figure.
+
+    Returns:
+        None.
+    """
+    logger.info(colored("Adding clipped log scores to the extreme tournament leaderboard.", "red"))
+    leaderboard_entries, _ = download_and_compile_processed_forecast_files(
+        bucket=env.PROCESSED_FORECAST_SETS_BUCKET,
+        min_days=50,
+        min_num_market_questions=50,
+        filter_extreme_markets=True,
+    )
+    df = combine_forecasting_rounds(leaderboard_entries)
+    df = filter_to_tournament_leaderboard_models(df)
+    summary = summarize_clipped_log_skill(df)
+    identity = (
+        df.groupby("model_pk", dropna=False)
+        .agg(
+            organization=("organization", "first"),
+            model_organization=("model_organization", "first"),
+            model=("model", "first"),
+        )
+        .reset_index()
+    )
+    summary = summary.merge(identity, on="model_pk", how="left")
+    benchmark = summary["organization"] == constants.BENCHMARK_NAME
+    summary.loc[benchmark, "model"] = summary.loc[benchmark, "model"].str.replace(
+        "freeze values", "crowd forecast", regex=False
+    )
+    summary = (
+        summary.groupby(["organization", "model_organization", "model"], dropna=False)[
+            list(CLIPPED_LOG_SKILL_COLUMNS)
+        ]
+        .mean()
+        .reset_index()
+        .rename(
+            columns={
+                "organization": "Team",
+                "model_organization": "Model Organization",
+                "model": "Model",
+                "clipped_log_skill_bits_dataset": "Log score dataset",
+                "clipped_log_skill_bits_market": "Log score market",
+                "clipped_log_skill_bits_overall": "Log score overall",
+            }
+        )
+    )
+    for column in LOG_SCORE_DISPLAY_COLUMNS:
+        summary[column] = summary[column].round(3)
+
+    directory = data_utils.get_mounted_bucket(bucket=env.PUBLIC_RELEASE_BUCKET)
+    leaderboard_path = f"{directory}/leaderboards/csv/leaderboard_extreme_tournament.csv"
+    board = pd.read_csv(leaderboard_path)
+    board = board.drop(
+        columns=[column for column in LOG_SCORE_DISPLAY_COLUMNS if column in board.columns]
+    )
+    merged = board.merge(summary, on=["Team", "Model Organization", "Model"], how="left")
+    if len(merged) != len(board):
+        raise ValueError("Log-score join duplicated extreme tournament leaderboard rows.")
+    for column in LOG_SCORE_DISPLAY_COLUMNS:
+        merged[column] = merged[column].fillna("")
+    unmatched = int((merged["Log score market"] == "").sum())
+    if unmatched:
+        logger.warning(f"{unmatched} leaderboard rows have no clipped log score.")
+    merged.to_csv(leaderboard_path, index=False)
+    write_leaderboard_html_file(
+        df=merged,
+        sorting_column_number=9,
+        leaderboard_type=LeaderboardType.EXTREME_TOURNAMENT,
+    )
+
+    sota = pd.read_csv(f"{directory}/leaderboards/csv/sota_graph_extreme_tournament.csv")
+    sota = sota.merge(
+        summary[["Team", "Model Organization", "Model", *LOG_SCORE_DISPLAY_COLUMNS]],
+        on=["Team", "Model Organization", "Model"],
+        how="left",
+    )
+    write_log_score_sota_graph_csv(
+        df=sota,
+        leaderboard_type=LeaderboardType.EXTREME_TOURNAMENT,
+    )
+    logger.info(colored("Added clipped log scores.", "red"))
+
+
 if __name__ == "__main__":
     leaderboard_type = os.environ.get("LEADERBOARD_TYPE")
     if leaderboard_type == "baseline":
@@ -3718,10 +4058,17 @@ if __name__ == "__main__":
         driver(LeaderboardType.LOW_PROBABILITY)
     elif leaderboard_type == "low_probability_tournament":
         driver(LeaderboardType.LOW_PROBABILITY_TOURNAMENT)
+    elif leaderboard_type == "extreme":
+        driver(LeaderboardType.EXTREME)
+    elif leaderboard_type == "extreme_tournament":
+        driver(LeaderboardType.EXTREME_TOURNAMENT)
+    elif leaderboard_type == "extreme_tournament_log_score":
+        refresh_extreme_tournament_log_score()
     elif leaderboard_type == "preliminary":
         driver_preliminary()
     else:
         raise ValueError(
             "LEADERBOARD_TYPE must be 'baseline', 'tournament', 'preliminary', "
-            "'low_probability', or 'low_probability_tournament'."
+            "'low_probability', 'low_probability_tournament', 'extreme', "
+            "'extreme_tournament', or 'extreme_tournament_log_score'."
         )

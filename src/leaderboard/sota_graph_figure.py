@@ -3,13 +3,14 @@
 The Explore page on the website draws this chart with d3 from `sota_graph_<type>.csv` and
 `parity_dates.<stem>.json`. Only the baseline and tournament leaderboards are published
 there, so this module redraws the same chart locally with matplotlib for any leaderboard
-type, including the low-probability boards.
+type, including the low-probability and extreme boards.
 """
 
 import json
 import logging
 import os
 import sys
+from datetime import timedelta
 from itertools import cycle
 from typing import Dict, List, Optional, Tuple
 
@@ -278,6 +279,10 @@ def render_figure(
     score_type: str,
     title: str,
     projected_parity: Optional[dict],
+    ylabel: str = "Brier Index (%)",
+    score_decimals: int = 1,
+    xmin: Optional[pd.Timestamp] = None,
+    ymin: Optional[float] = None,
 ) -> plt.Figure:
     """Draw the SOTA figure for one score type.
 
@@ -286,6 +291,10 @@ def render_figure(
         score_type (str): One of "overall", "market" or "dataset".
         title (str): Figure title.
         projected_parity (Optional[dict]): Parity date summary for this score type.
+        ylabel (str): Vertical axis label.
+        score_decimals (int): Decimal places for reference-line labels.
+        xmin (Optional[pd.Timestamp]): Left edge of the release-date axis.
+        ymin (Optional[float]): Lower edge of the score axis.
 
     Returns:
         plt.Figure: The rendered figure.
@@ -327,7 +336,10 @@ def render_figure(
     )
     ax.scatter([], [], s=24, color=MODEL_COLOR, label="Non-SOTA model")
 
-    keep_labels = label_positions(df_sota, _x_span_days(df_points))
+    visible_points = df_points if xmin is None else df_points[df_points["release_date"] >= xmin]
+    if visible_points.empty:
+        visible_points = df_points
+    keep_labels = label_positions(df_sota, _x_span_days(visible_points))
     for (_, row), keep, offset in zip(df_sota.iterrows(), keep_labels, cycle([9, 21])):
         if not keep:
             continue
@@ -352,13 +364,21 @@ def render_figure(
             linestyle=dashes,
             linewidth=1.0,
             zorder=1,
-            label=f"{label} ({value:.1f})",
+            label=f"{label} ({value:.{score_decimals}f})",
         )
         reference_handles.append(line)
 
-    ax.set_ylim(*_y_limits(df_points, references))
+    y_low, y_high = _y_limits(df_points, references)
+    if ymin is not None:
+        y_low = ymin
+    ax.set_ylim(y_low, y_high)
+    if xmin is not None:
+        right = pd.to_datetime(df_points["release_date"].max()).to_pydatetime() + timedelta(
+            days=31
+        )
+        ax.set_xlim(pd.to_datetime(xmin).to_pydatetime(), right)
     ax.set_xlabel("Model release date")
-    ax.set_ylabel("Brier Index (%)")
+    ax.set_ylabel(ylabel)
     ax.set_title(f"{title} — {score_type} questions")
     ax.xaxis.set_major_locator(mdates.AutoDateLocator())
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
@@ -477,16 +497,38 @@ def driver() -> None:
         if score_type.strip()
     ]
 
+    score_kind = os.environ.get("SCORE_KIND", "brier_index")
     directory = data_utils.get_mounted_bucket(bucket=env.PUBLIC_RELEASE_BUCKET)
-    source = f"{directory}/leaderboards/csv/sota_graph_{leaderboard_type}.csv"
+    source_name = f"sota_graph_{leaderboard_type}"
+    ylabel = "Brier Index (%)"
+    score_decimals = 1
+    file_label = leaderboard_type
+    xmin = None
+    ymin = None
+    if score_kind == "log_score":
+        source_name = f"{source_name}_log_score"
+        ylabel = "Log score (bits vs Always 0.5)"
+        score_decimals = 3
+        file_label = f"{leaderboard_type}_log_score"
+        if leaderboard_type == "extreme_tournament":
+            xmin = pd.Timestamp("2024-04-01")
+            ymin = -2.0
+    elif score_kind != "brier_index":
+        raise ValueError("SCORE_KIND must be 'brier_index' or 'log_score'.")
+
+    source = f"{directory}/leaderboards/csv/{source_name}.csv"
     if not os.path.exists(source):
         raise FileNotFoundError(
             f"{source} not found. Run `LEADERBOARD_TYPE={leaderboard_type} python main.py` first."
         )
 
     df = pd.read_csv(source)
-    projected_parity = read_projected_parity_dates(directory, leaderboard_type)
+    projected_parity = {}
+    if score_kind == "brier_index":
+        projected_parity = read_projected_parity_dates(directory, leaderboard_type)
     title = leaderboard_type.replace("_", " ").title()
+    if score_kind == "log_score":
+        title = f"{title} log score"
 
     output_dir = f"{directory}/{OUTPUT_FOLDER}"
     os.makedirs(output_dir, exist_ok=True)
@@ -496,8 +538,12 @@ def driver() -> None:
             score_type=score_type,
             title=title,
             projected_parity=projected_parity.get(score_type),
+            ylabel=ylabel,
+            score_decimals=score_decimals,
+            xmin=xmin,
+            ymin=ymin,
         )
-        destination = f"{output_dir}/sota_graph_{leaderboard_type}_{score_type}.png"
+        destination = f"{output_dir}/sota_graph_{file_label}_{score_type}.png"
         figure.savefig(destination, dpi=200)
         plt.close(figure)
         logger.info(colored(f"Wrote {destination}", "red"))
