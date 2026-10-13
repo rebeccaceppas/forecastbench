@@ -1,0 +1,76 @@
+# Configuration for the sub-benchmark accuracy analysis.
+#
+# Paths are relative to this folder. Every run copies this file into its output folder, so a
+# result can always be traced back to the settings that produced it.
+
+[data]
+# Local copy of the processed forecast sets bucket (see README for the `gcloud storage rsync`).
+processed_forecasts_dir = "data/processed_forecast_sets"
+# Published question sets are downloaded here once and reused.
+question_sets_dir = "data/question_sets"
+# Output of `build_cache.py`.
+cache_dir = "data/cache"
+# Same round filters as the production leaderboard driver (`src/leaderboard/main.py: driver`).
+min_days = 50
+min_num_market_questions = 50
+
+[analysis]
+# "tournament" (primary) or "baseline" (secondary).
+leaderboard = "tournament"
+# Market low-probability subset. One of: "extreme" (both tails, flipped onto the low side),
+# "low" (price on due date <= threshold only), "high" (price >= 1 - threshold only).
+subset = "extreme"
+threshold = 0.10
+# Rounds (forecast due dates, YYYY-MM-DD) to keep. Empty strings mean no bound.
+min_forecast_due_date = ""
+max_forecast_due_date = ""
+# Models with fewer subset questions than this are dropped from plots and listed.
+min_n = 30
+# Human comparisons with fewer subset questions than this are shown as caveated points only.
+min_n_human = 30
+
+[scoring]
+# Forecasts are clipped to [clip, 1 - clip] before the log score, for every forecaster.
+log_clip = 0.005
+# Difficulty adjustment used for headline numbers: "all_question_fit", "subset_fit" or "none".
+headline_difficulty = "all_question_fit"
+# Question-level bootstrap replicates (about 200 while iterating; 1999 for final numbers).
+n_bootstrap = 200
+seed = 20261008
+# Refitting the subset-only fixed effects in every replicate is slow; off by default, so the
+# subset fit is reported as a point estimate only.
+bootstrap_subset_fit = false
+
+[comparisons]
+# Headline comparison forecasters. Scores are reported as (comparison - model), so positive
+# means the model beat the comparison.
+primary = [
+  "Market price (due date)",
+  "Always base rate",
+  "Superforecaster median forecast",
+  "Public median forecast",
+]
+secondary = [
+  "Naive Forecaster",
+  "Always 1%",
+  "Always 5%",
+  "LLM crowd",
+]
+# The comparison the trend plots are drawn relative to.
+reference = "Market price (due date)"
+# A base rate needs at least this many earlier resolved subset questions; otherwise the
+# leave-one-round-out rate is used and flagged.
+base_rate_min_n = 20
+
+[checks]
+# Check 4 of the downward-curve diagnostics: keep rounds where at least this share of the
+# subset has resolved.
+min_resolved_share = 0.8
+
+[plots]
+# Number of models labeled by name on the trend plots.
+n_labels = 8
+# Number of LLMs shown individually on the calibration plot (the best by headline score).
+n_calibration_models = 2
+# Rows in the surprises table.
+n_surprises = 200
