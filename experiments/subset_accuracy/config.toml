@@ -68,6 +68,13 @@ base_rate_min_n = 20
 min_resolved_share = 0.8
 
 [plots]
+# Trend plots omit release dates before this (YYYY-MM-DD). Empty shows the full range.
+min_release_date = "2025-07-01"
+# Y-axis for each trend plot (score difference vs. the market).
+brier_y_min = -0.1
+brier_y_max = 0.05
+log_y_min = -0.2
+log_y_max = 0.12
 # Number of models labeled by name on the trend plots.
 n_labels = 8
 # Number of LLMs shown individually on the calibration plot (the best by headline score).

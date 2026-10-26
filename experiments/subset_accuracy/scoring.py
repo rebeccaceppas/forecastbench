@@ -30,7 +30,7 @@ def add_row_scores(df: pd.DataFrame, log_clip: float) -> pd.DataFrame:
     return df
 
 
-def question_effects(df: pd.DataFrame, score_col: str) -> pd.Series:
+def question_effects(df: pd.DataFrame, score_col: str, question_type: str = "market") -> pd.Series:
     """Fit score = model effect + question effect and return the question effects.
 
     Uses `two_way_fixed_effects` from the production leaderboard, so the fit drops the same
@@ -38,15 +38,16 @@ def question_effects(df: pd.DataFrame, score_col: str) -> pd.Series:
     released more than a year before the due date).
 
     Args:
-      df (pd.DataFrame): Market rows for the leaderboard's models, with `score_col`.
+      df (pd.DataFrame): Leaderboard rows with `score_col`.
       score_col (str): "brier" or "log".
+      question_type (str): "market" or "dataset". Both use the two-way fixed effects fit.
     """
     lb = leaderboard()
     df_fit = df.copy()
     df_fit["brier_score"] = df_fit[score_col]
     fitted = lb.two_way_fixed_effects(
         df_fit,
-        question_type="market",
+        question_type=question_type,
         market_question_adjustment=lb.MarketQuestionAdjustment.TWO_WAY_FIXED_EFFECTS,
     )
     return fitted.drop_duplicates("question_pk").set_index("question_pk")["question_fixed_effect"]

@@ -513,8 +513,11 @@ def main(config_path: str, n_bootstrap_override: int | None) -> Path:
     # 6. Figures for both rules.
     for rule in scoring.SCORE_RULES:
         col = f"{rule}_{headline}_vs_{reference}"
-        frontier, band = frontier_with_band(results, draws.get(rule), llm_pks, reference, col)
+        frontier, _ = frontier_with_band(results, draws.get(rule), llm_pks, reference, col)
         frontier.to_csv(tables / f"sota_frontier_{rule}.csv", index=False)
+        plots.monthly_llm_trend(
+            results.loc[llm_pks], col, p_cfg.get("min_release_date") or None
+        ).to_csv(tables / f"monthly_llm_trend_{rule}.csv", index=False)
         references = {}
         # Primary comparisons are drawn as reference lines; secondary ones are in the tables.
         for name, pk in primary.items():
@@ -529,8 +532,6 @@ def main(config_path: str, n_bootstrap_override: int | None) -> Path:
         plots.trend_plot(
             llms=results.loc[llm_pks],
             externals=results.loc[ext_pks],
-            frontier=frontier,
-            band=band,
             references=references,
             col=col,
             reference_name=reference,
@@ -541,8 +542,10 @@ def main(config_path: str, n_bootstrap_override: int | None) -> Path:
                 f"{' or ≥' + str(100 - pct) + '% (flipped)' if a_cfg['subset'] == 'extreme' else ''}"
                 f": {plots.RULE_LABELS[rule]}"
             ),
-            n_labels=p_cfg["n_labels"],
             path=figures / f"trend_release_date_{rule}.png",
+            min_date=p_cfg.get("min_release_date") or None,
+            y_min=p_cfg.get(f"{rule}_y_min", p_cfg.get("y_min")),
+            y_max=p_cfg.get(f"{rule}_y_max", p_cfg.get("y_max")),
         )
 
     # 7. Extreme vs. non-extreme (both use the all-question fit).
@@ -774,6 +777,7 @@ def write_summary(
         "- `tables/base_rates.csv`: out-of-sample base rates (with fallback flag)",
         "- `tables/surprises.csv|html`: questions that resolved against the price",
         "- `tables/calibration.csv`, `figures/calibration.png`",
+        "- `tables/monthly_llm_trend_{brier,log}.csv`: ForecastBench median by release month",
         "- `figures/trend_release_date_{brier,log}.png`",
         "- `figures/extreme_vs_nonextreme_{brier,log}.png`",
         "- `figures/downward_curve_checks.png`",

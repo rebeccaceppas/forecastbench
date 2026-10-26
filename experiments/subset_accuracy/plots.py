@@ -46,6 +46,9 @@ plt.rcParams.update(
 )
 
 RULE_LABELS = {"brier": "Brier", "log": "log score"}
+# ForecastBench points use `errorbar`, whose size is a diameter in points. Scatter sizes are
+# areas, so external submissions use the squared diameter to match those points.
+LLM_MARKER_PT = 4.5
 
 
 def _save(fig: plt.Figure, path: Path) -> None:
@@ -113,127 +116,219 @@ def _date_axis(ax: plt.Axes) -> None:
     ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
 
 
+def _release_window(
+    df: pd.DataFrame, min_date: Optional[str]
+) -> tuple[pd.DataFrame, Optional[pd.Timestamp]]:
+    """Return rows whose release date is on or after `min_date`.
+
+    Args:
+      df (pd.DataFrame): Rows with `model_release_date`.
+      min_date (Optional[str]): Inclusive lower bound, YYYY-MM-DD, or None for no bound.
+    """
+    min_ts = pd.Timestamp(min_date) if min_date else None
+    if df.empty or min_ts is None:
+        return df, min_ts
+    keep = pd.to_datetime(df["model_release_date"]) >= min_ts
+    return df.loc[keep].copy(), min_ts
+
+
+def monthly_llm_trend(llms: pd.DataFrame, col: str, min_date: Optional[str] = None) -> pd.DataFrame:
+    """Median and interquartile range of ForecastBench LLMs by release month.
+
+    External submissions are not included. Months with fewer than four models get a median
+    and a count, and no interquartile range.
+
+    Args:
+      llms (pd.DataFrame): ForecastBench LLM rows with `model_release_date` and `col`.
+      col (str): Score difference. Positive means better than the reference.
+      min_date (Optional[str]): Inclusive release-date bound, YYYY-MM-DD.
+    """
+    empty = pd.DataFrame(columns=["month", "date", "n", "median", "q25", "q75"])
+    window, _ = _release_window(llms, min_date)
+    df = window.dropna(subset=["model_release_date", col]).copy()
+    if df.empty:
+        return empty
+    df["month"] = pd.to_datetime(df["model_release_date"]).dt.to_period("M")
+    rows = []
+    for month, group in df.groupby("month", sort=True):
+        values = group[col].astype(float)
+        n = int(values.notna().sum())
+        q25 = q75 = np.nan
+        if n >= 4:
+            q25 = float(values.quantile(0.25))
+            q75 = float(values.quantile(0.75))
+        rows.append(
+            {
+                "month": str(month),
+                "date": month.to_timestamp() + pd.Timedelta(days=14),
+                "n": n,
+                "median": float(values.median()),
+                "q25": q25,
+                "q75": q75,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _month_segments(trend: pd.DataFrame) -> List[pd.DataFrame]:
+    """Split a monthly trend where consecutive rows skip a calendar month."""
+    segments: List[pd.DataFrame] = []
+    current: List[dict] = []
+    previous = None
+    for _, row in trend.iterrows():
+        period = pd.Period(row["month"], freq="M")
+        if previous is not None and period != previous + 1 and current:
+            segments.append(pd.DataFrame(current))
+            current = []
+        current.append(row.to_dict())
+        previous = period
+    if current:
+        segments.append(pd.DataFrame(current))
+    return segments
+
+
 def trend_plot(
     llms: pd.DataFrame,
     externals: pd.DataFrame,
-    frontier: pd.DataFrame,
-    band: pd.DataFrame,
     references: Dict[str, float],
     col: str,
     reference_name: str,
     rule: str,
     title: str,
-    n_labels: int,
     path: Path,
+    min_date: Optional[str] = None,
+    y_min: Optional[float] = None,
+    y_max: Optional[float] = None,
+    y_caption: Optional[str] = None,
 ) -> None:
     """Score difference vs. the reference forecaster against model release date.
 
+    ForecastBench LLMs are drawn individually and summarized by a monthly median. External
+    submissions are drawn at their first due date and are not part of that median.
+
     Args:
-      llms (pd.DataFrame): ForecastBench LLMs with `model_release_date`, `col`,
-        `<col>_ci_lower`, `<col>_ci_upper` and `model`.
+      llms (pd.DataFrame): ForecastBench LLMs with `model_release_date` and `col`.
       externals (pd.DataFrame): External submissions, placed at their first due date.
-      frontier (pd.DataFrame): SOTA models (point estimate) with `model_release_date`, `col`.
-      band (pd.DataFrame): `model_release_date`, `lower`, `upper` of the bootstrapped frontier.
       references (Dict[str, float]): Comparison forecasters on the same scale.
       col (str): Column holding the difference vs. the reference (positive = better).
       reference_name (str): Name of the reference forecaster (the zero line).
       rule (str): "brier" or "log".
       title (str): Figure title.
-      n_labels (int): Number of points to label by name.
       path (Path): Output file.
+      min_date (Optional[str]): Inclusive left edge of the release-date axis, YYYY-MM-DD.
+      y_min (Optional[float]): Lower y limit. Used only together with `y_max`.
+      y_max (Optional[float]): Upper y limit. Used only together with `y_min`.
+      y_caption (Optional[str]): Y-axis label. The market wording is used when this is omitted.
     """
     fig, ax = plt.subplots(figsize=(9, 5.2))
-    dates = pd.to_datetime(llms["model_release_date"])
-    lower = llms[col] - llms[f"{col}_ci_lower"]
-    upper = llms[f"{col}_ci_upper"] - llms[col]
-    ax.errorbar(
-        dates,
-        llms[col],
-        yerr=np.vstack([lower.clip(lower=0).to_numpy(), upper.clip(lower=0).to_numpy()]),
-        fmt="o",
-        ms=4.5,
-        color=MODEL_POINT,
-        ecolor=GRID,
-        elinewidth=0.8,
-        mec="white",
-        mew=0.5,
-        zorder=2,
-        label="ForecastBench LLM (95% CI)",
-    )
-    if not band.empty:
-        ax.fill_between(
-            pd.to_datetime(band["model_release_date"]),
-            band["lower"],
-            band["upper"],
-            step="post",
-            color=SERIES[0],
-            alpha=0.15,
-            lw=0,
-            zorder=1,
-            label="SOTA frontier, bootstrap 95% band",
-        )
-    if not frontier.empty:
-        x_end = max(dates.max(), pd.to_datetime(frontier["model_release_date"]).max())
-        steps = pd.concat(
-            [frontier, frontier.tail(1).assign(model_release_date=x_end)], ignore_index=True
-        )
-        ax.step(
-            pd.to_datetime(steps["model_release_date"]),
-            steps[col],
-            where="post",
-            color=SERIES[0],
-            lw=2,
-            zorder=3,
-            label="SOTA frontier",
-        )
+    llms_draw, min_ts = _release_window(llms, min_date)
+    externals_draw, _ = _release_window(externals, min_date)
+    trend = monthly_llm_trend(llms_draw, col)
+
+    plotted_dates = []
+    if not llms_draw.empty:
+        dates = pd.to_datetime(llms_draw["model_release_date"])
+        plotted_dates.append(dates)
         ax.scatter(
-            pd.to_datetime(frontier["model_release_date"]),
-            frontier[col],
-            s=40,
-            color=SERIES[0],
+            dates,
+            llms_draw[col],
+            s=LLM_MARKER_PT**2,
+            color=MODEL_POINT,
             edgecolor="white",
-            lw=1,
-            zorder=4,
+            linewidths=0.4,
+            zorder=2,
+            label="ForecastBench LLM",
         )
-    if not externals.empty:
+    if not externals_draw.empty:
+        plotted_dates.append(pd.to_datetime(externals_draw["model_release_date"]))
         ax.scatter(
-            pd.to_datetime(externals["model_release_date"]),
-            externals[col],
-            s=42,
+            pd.to_datetime(externals_draw["model_release_date"]),
+            externals_draw[col],
+            s=LLM_MARKER_PT**2,
             facecolor="white",
             edgecolor=SERIES[1],
-            lw=1.6,
+            linewidths=0.8,
+            zorder=3,
+            label="External submission (not in the trend)",
+        )
+    labeled_band = False
+    labeled_line = False
+    for segment in _month_segments(trend):
+        if segment["q25"].notna().any():
+            ax.fill_between(
+                pd.to_datetime(segment["date"]),
+                segment["q25"],
+                segment["q75"],
+                color=SERIES[0],
+                alpha=0.18,
+                lw=0,
+                zorder=1,
+                label="Interquartile range" if not labeled_band else None,
+            )
+            labeled_band = True
+        ax.plot(
+            pd.to_datetime(segment["date"]),
+            segment["median"],
+            color=SERIES[0],
+            lw=2,
+            marker="o",
+            ms=5.5,
             zorder=4,
-            label="External submission (at first due date)",
+            label="Monthly median, ForecastBench LLMs" if not labeled_line else None,
         )
-
-    labeled = pd.concat(
-        [frontier.assign(_kind="llm"), externals.nlargest(n_labels // 2, col).assign(_kind="ext")]
-    )
-    labeled = labeled.nlargest(n_labels, col) if len(labeled) > n_labels else labeled
-    for _, row in labeled.iterrows():
+        labeled_line = True
+    label_offset = 8
+    previous_date = None
+    for _, row in trend.iterrows():
+        date = pd.to_datetime(row["date"])
+        if previous_date is not None and date - previous_date < pd.Timedelta(days=50):
+            label_offset = 20 if label_offset == 8 else 8
+        else:
+            label_offset = 8
+        previous_date = date
         ax.annotate(
-            row["model"],
-            xy=(pd.to_datetime(row["model_release_date"]), row[col]),
-            xytext=(5, 5),
+            f"n={int(row['n'])}",
+            xy=(date, row["median"]),
+            xytext=(0, label_offset),
             textcoords="offset points",
-            fontsize=6.5,
-            color=INK_SECONDARY,
+            ha="center",
+            va="bottom",
+            fontsize=6,
+            color=INK_MUTED,
+            zorder=6,
         )
 
-    all_dates = pd.concat([dates, pd.to_datetime(externals.get("model_release_date", pd.Series()))])
-    span = all_dates.max() - all_dates.min()
-    ax.set_xlim(all_dates.min() - span * 0.03, all_dates.max() + span * 0.03)
-    x_right = mdates.date2num(all_dates.max() + span * 0.05)
+    all_dates = (
+        pd.concat(plotted_dates, ignore_index=True)
+        if plotted_dates
+        else pd.Series(dtype="datetime64[ns]")
+    )
+    if all_dates.empty:
+        right = min_ts if min_ts is not None else pd.Timestamp("2025-07-01")
+        left = right
+    else:
+        right = all_dates.max()
+        left = min_ts if min_ts is not None else all_dates.min()
+    span = right - left
+    if not isinstance(span, pd.Timedelta) or span <= pd.Timedelta(0):
+        span = pd.Timedelta(days=30)
+    left_pad = pd.Timedelta(0) if min_ts is not None else span * 0.03
+    ax.set_xlim(left - left_pad, right + span * 0.04)
+    x_right = mdates.date2num(right + span * 0.055)
     _date_axis(ax)
     _reference_lines(ax, {reference_name: 0.0, **references}, x_right, emphasis=reference_name)
     ax.set_xlabel("Model release date")
     ax.set_ylabel(
-        f"Difficulty-adjusted {RULE_LABELS[rule]}: {reference_name} minus model\n"
-        "(positive = better than the reference)"
+        y_caption
+        or (
+            f"Difficulty-adjusted {RULE_LABELS[rule]}: {reference_name} minus model\n"
+            "(positive = better than the market)"
+        )
     )
     ax.set_title(title, loc="left")
-    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.13), ncol=4, fontsize=7.5)
+    if y_min is not None and y_max is not None:
+        ax.set_ylim(y_min, y_max)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.16), ncol=2, fontsize=7.5)
     _save(fig, path)
 
 
@@ -367,6 +462,10 @@ def downward_curve_checks_plot(
     col: str,
     min_resolved_share: float,
     path: Path,
+    suptitle: str = "Why does the SOTA curve slope down on extreme market questions?",
+    panel1_title: str = "1. Surprise rate of resolved subset questions",
+    yes_ylabel: str = "Share resolving against the price (flipped yes)",
+    extremity_ylabel: str = "Median forecast on subset (flipped)",
 ) -> None:
     """Four diagnostics for the downward SOTA curve (plan section 4.4).
 
@@ -380,6 +479,10 @@ def downward_curve_checks_plot(
       col (str): Frontier score column.
       min_resolved_share (float): Threshold used for check 4.
       path (Path): Output file.
+      suptitle (str): Figure title.
+      panel1_title (str): Title of the yes-rate panel.
+      yes_ylabel (str): Y-axis label of the yes-rate panel.
+      extremity_ylabel (str): Y-axis label of the forecast-extremity panel.
     """
     fig, axes = plt.subplots(2, 2, figsize=(11, 8))
     dates = pd.to_datetime(rounds["forecast_due_date"])
@@ -412,8 +515,8 @@ def downward_curve_checks_plot(
             color=INK_MUTED,
             ha="center",
         )
-    ax.set_title("1. Surprise rate of resolved subset questions", loc="left", fontsize=10)
-    ax.set_ylabel("Share resolving against the price (flipped yes)")
+    ax.set_title(panel1_title, loc="left", fontsize=10)
+    ax.set_ylabel(yes_ylabel)
     ax.yaxis.set_major_formatter(matplotlib.ticker.PercentFormatter(1))
 
     ax = axes[0, 1]
@@ -455,7 +558,7 @@ def downward_curve_checks_plot(
         color=INK,
     )
     ax.set_title("3. How extreme each LLM's forecasts are", loc="left", fontsize=10)
-    ax.set_ylabel("Median forecast on subset (flipped)")
+    ax.set_ylabel(extremity_ylabel)
     ax.yaxis.set_major_formatter(matplotlib.ticker.PercentFormatter(1, decimals=1))
     ax.set_xlabel("Model release date")
 
@@ -482,12 +585,150 @@ def downward_curve_checks_plot(
 
     for ax in axes.flat:
         _date_axis(ax)
-    fig.suptitle(
-        "Why does the SOTA curve slope down on extreme market questions?",
-        x=0.01,
-        ha="left",
-        fontsize=12,
-        fontweight="bold",
-    )
+    fig.suptitle(suptitle, x=0.01, ha="left", fontsize=12, fontweight="bold")
     fig.tight_layout()
+    _save(fig, path)
+
+
+def _display_name(name: str) -> str:
+    return str(name).removesuffix("†")
+
+
+def sota_frontier_plot(
+    llms: pd.DataFrame,
+    frontier: pd.DataFrame,
+    band: pd.DataFrame,
+    col: str,
+    rule: str,
+    reference_name: str,
+    title: str,
+    path: Path,
+) -> None:
+    """Running-best ForecastBench LLM, with the bootstrap band of that running maximum.
+
+    Grey points are every eligible LLM. The step holds each record until the next one and
+    continues to the last release date in `llms`.
+
+    Args:
+      llms (pd.DataFrame): ForecastBench LLMs with `model_release_date` and `col`.
+      frontier (pd.DataFrame): Output of `find_sota_models`, with `model` and `col`.
+      band (pd.DataFrame): Bootstrap 2.5/97.5 of the running maximum (`lower`, `upper`).
+      col (str): Score column (positive = better than the reference).
+      rule (str): "brier" or "log".
+      reference_name (str): Reference forecaster.
+      title (str): Figure title.
+      path (Path): Output file.
+    """
+    fig, ax = plt.subplots(figsize=(8.2, 5.2))
+    dates = pd.to_datetime(llms["model_release_date"])
+    ax.scatter(
+        dates,
+        llms[col],
+        s=LLM_MARKER_PT**2,
+        color=MODEL_POINT,
+        zorder=2,
+        label="ForecastBench LLM",
+    )
+    if not band.empty:
+        band_dates = pd.to_datetime(band["model_release_date"])
+        ax.fill_between(
+            band_dates,
+            band["lower"],
+            band["upper"],
+            color=SERIES[0],
+            alpha=0.18,
+            lw=0,
+            zorder=1,
+            label="Bootstrap 95% of the running best",
+        )
+    if not frontier.empty:
+        line = frontier.sort_values("model_release_date")
+        line_dates = pd.to_datetime(line["model_release_date"])
+        line_scores = line[col].to_numpy()
+        if len(dates) and line_dates.iloc[-1] < dates.max():
+            line_dates = pd.concat([line_dates, pd.Series([dates.max()])], ignore_index=True)
+            line_scores = np.append(line_scores, line_scores[-1])
+        ax.step(
+            line_dates,
+            line_scores,
+            where="post",
+            color=SERIES[0],
+            lw=2,
+            zorder=3,
+            label="Best model released so far",
+        )
+        ax.scatter(
+            pd.to_datetime(frontier["model_release_date"]),
+            frontier[col],
+            color=SERIES[0],
+            s=36,
+            zorder=4,
+            edgecolor="white",
+            lw=0.6,
+        )
+        for _, row in frontier.iterrows():
+            ax.annotate(
+                _display_name(row["model"]),
+                xy=(pd.to_datetime(row["model_release_date"]), row[col]),
+                xytext=(6, 6),
+                textcoords="offset points",
+                fontsize=7,
+                color=INK,
+            )
+    ax.axhline(0, color=INK, lw=1)
+    ax.set_ylabel(f"{reference_name} minus model (positive = better)")
+    ax.set_xlabel("Model release date")
+    ax.set_title(title, loc="left")
+    ax.annotate(
+        RULE_LABELS[rule],
+        xy=(0.99, 0.02),
+        xycoords="axes fraction",
+        ha="right",
+        fontsize=8,
+        color=INK_MUTED,
+    )
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.16), ncol=2, fontsize=7.5)
+    _date_axis(ax)
+    _save(fig, path)
+
+
+def eci_score_plot(matched: pd.DataFrame, col: str, rule: str, path: Path) -> None:
+    """Difficulty-adjusted score against Epoch's ECI, one point per matched model.
+
+    Args:
+      matched (pd.DataFrame): One row per model run with `eci`, `col`, `model` and `on_frontier`.
+      col (str): Score column (positive = better than the market).
+      rule (str): "brier" or "log".
+      path (Path): Output file.
+    """
+    fig, ax = plt.subplots(figsize=(7.4, 5.4))
+    rest = matched[~matched["on_frontier"]]
+    frontier = matched[matched["on_frontier"]]
+    ax.scatter(rest["eci"], rest[col], s=28, color=SERIES[0], zorder=3, label="Matched model")
+    if not frontier.empty:
+        ax.scatter(
+            frontier["eci"],
+            frontier[col],
+            s=46,
+            color=SERIES[1],
+            zorder=4,
+            label="On the SOTA frontier",
+        )
+        for _, row in frontier.iterrows():
+            ax.annotate(
+                _display_name(row["model"]),
+                xy=(row["eci"], row[col]),
+                xytext=(4, 4),
+                textcoords="offset points",
+                fontsize=6.5,
+                color=INK_SECONDARY,
+            )
+    ax.axhline(0, color=INK, lw=1)
+    ax.set_xlabel("Epoch Capabilities Index")
+    ax.set_ylabel("Market minus model (positive = better)")
+    ax.set_title(
+        f"Low-probability market questions vs. Epoch ECI ({RULE_LABELS[rule]})",
+        loc="left",
+    )
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.16), ncol=2, fontsize=7.5)
     _save(fig, path)
